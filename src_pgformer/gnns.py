@@ -543,7 +543,7 @@ class GAT(nn.Module):
             GATConv(hidden_channels*heads, out_channels, dropout=dropout, heads=out_heads, edge_dim=1, concat=False))
 
         self.dropout = dropout
-        self.activation = F.elu 
+        self.activation = F.elu
         self.use_bn = use_bn
 
     def reset_parameters(self):
@@ -564,6 +564,100 @@ class GAT(nn.Module):
             x = F.dropout(x, p=self.dropout, training=self.training)
         x = self.convs[-1](x, edge_index, edge_weight)
         return x
+
+
+class EGNNLayer(nn.Module):
+    def __init__(self, hidden_channels, coord_channels, dropout=0.5):
+        super(EGNNLayer, self).__init__()
+        edge_input_channels = hidden_channels * 2 + 1
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(edge_input_channels, hidden_channels),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.SiLU())
+        self.node_mlp = nn.Sequential(
+            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, hidden_channels))
+        self.coord_mlp = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.SiLU(),
+            nn.Linear(hidden_channels, 1, bias=False))
+        self.coord_norm = nn.LayerNorm(coord_channels)
+
+    def reset_parameters(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                module.reset_parameters()
+        self.coord_norm.reset_parameters()
+
+    def forward(self, h, coord, edge_index, edge_weight=None):
+        row, col = edge_index
+        coord_diff = coord[row] - coord[col]
+        radial = torch.sum(coord_diff ** 2, dim=-1, keepdim=True)
+        edge_feat = torch.cat([h[row], h[col], radial], dim=-1)
+        messages = self.edge_mlp(edge_feat)
+
+        if edge_weight is not None:
+            messages = messages * edge_weight.view(-1, 1)
+
+        agg = torch.zeros_like(h)
+        agg.index_add_(0, row, messages)
+        h = h + self.node_mlp(torch.cat([h, agg], dim=-1))
+
+        coord_update = coord_diff * self.coord_mlp(messages)
+        if edge_weight is not None:
+            coord_update = coord_update * edge_weight.view(-1, 1)
+        coord_agg = torch.zeros_like(coord)
+        coord_agg.index_add_(0, row, coord_update)
+        coord = self.coord_norm(coord + coord_agg / (coord.size(0) + 1))
+        return h, coord
+
+
+class EGNN(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers=2,
+                 dropout=0.5, coord_channels=3, use_bn=True):
+        super(EGNN, self).__init__()
+        self.coord_channels = min(coord_channels, in_channels)
+        self.input_proj = nn.Linear(in_channels, hidden_channels)
+        self.convs = nn.ModuleList([
+            EGNNLayer(hidden_channels, self.coord_channels, dropout=dropout)
+            for _ in range(num_layers)
+        ])
+        self.bns = nn.ModuleList([
+            nn.BatchNorm1d(hidden_channels)
+            for _ in range(num_layers)
+        ])
+        self.output_proj = nn.Linear(hidden_channels, out_channels)
+        self.dropout = dropout
+        self.use_bn = use_bn
+
+    def reset_parameters(self):
+        self.input_proj.reset_parameters()
+        for conv in self.convs:
+            conv.reset_parameters()
+        for bn in self.bns:
+            bn.reset_parameters()
+        self.output_proj.reset_parameters()
+
+    def forward(self, x: torch.FloatTensor,
+        edge_index: torch.LongTensor,
+        edge_weight: Optional[torch.FloatTensor]) -> torch.FloatTensor:
+        coord = x[:, :self.coord_channels]
+        h = self.input_proj(x)
+        h = F.silu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+
+        for i, conv in enumerate(self.convs):
+            h, coord = conv(h, coord, edge_index, edge_weight)
+            if self.use_bn:
+                h = self.bns[i](h)
+            h = F.silu(h)
+            h = F.dropout(h, p=self.dropout, training=self.training)
+        h = self.output_proj(h)
+        return h
 
 class MixHopLayer(nn.Module):
     """ Our MixHop layer """

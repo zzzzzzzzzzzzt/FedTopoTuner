@@ -7,7 +7,7 @@ PGFormer是一个基于图神经网络和联邦学习的性能预测框架，专
 ## 主要特性
 
 - **联邦学习框架**: 实现了多种聚合策略，包括FedAvg、performance_based等
-- **图神经网络**: 支持多种GNN模型（GCN、GAT、SGC等）
+- **图神经网络**: 支持多种GNN模型（GCN、GAT、SGC、EGNN等）
 - **性能预测**: 预测ANN算法的recall、qps、distcomp等关键指标
 - **多数据集支持**: 支持多种向量数据集的性能分析
 
@@ -73,7 +73,7 @@ python demo_performance_based.py
 ## 主要文件说明
 
 - `fedv3.py`: 联邦学习主框架，包含多种聚合策略
-- `gnns.py`: 图神经网络模型实现
+- `gnns.py`: 图神经网络模型实现，包含GCN、GAT、SGC、EGNN等模型
 - `utils.py`: 数据加载、图构建等工具函数
 - `pgformer.py`: PGFormer Transformer模型
 - `demo_performance_based.py`: 性能基础聚合策略演示

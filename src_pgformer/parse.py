@@ -37,6 +37,12 @@ def parse_method(args, d, c, d_para, device):
                     dropout=args.dropout, use_bn=args.use_bn, heads=args.gat_heads, out_heads=args.out_heads).to(device)
         suffix = 'hidden' + str(args.hidden_channels) + 'layers' + str(args.num_layers) + 'bn' + str(args.use_bn) +\
             'heads' + str(args.gat_heads) + 'out_heads' + str(args.out_heads)
+    elif args.method == 'egnn':
+        model = EGNN(d, args.hidden_channels, c, num_layers=args.num_layers,
+                     dropout=args.dropout, coord_channels=args.egnn_coord_channels,
+                     use_bn=args.use_bn).to(device)
+        suffix = 'hidden' + str(args.hidden_channels) + 'layers' + str(args.num_layers) + 'bn' + str(args.use_bn) +\
+            'coord' + str(args.egnn_coord_channels)
     elif args.method == 'mixhop':
         model = MixHop(d, args.hidden_channels, c, num_layers=args.num_layers,
                        dropout=args.dropout, hops=args.hops).to(device)
@@ -119,6 +125,8 @@ def parser_add_main_args(parser):
     parser.add_argument('--kernel', type=str, default='simple', choices=['simple', 'sigmoid'])
 
     # baseline model
+    parser.add_argument('--egnn_coord_channels', type=int, default=3,
+                        help='number of input feature channels used as EGNN coordinates')
     # parser.add_argument('--gat_heads', type=int, default=2,
     #                     help='attention heads for gat')
     # parser.add_argument('--out_heads', type=int, default=1,
