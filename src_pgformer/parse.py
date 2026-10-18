@@ -61,7 +61,8 @@ def parse_method(args, d, c, d_para, device):
         
     elif args.method == 'pgformer':
         model=pgformer(d,args.hidden_channels, c, d_para, num_layers=args.num_layers, alpha=args.alpha, dropout=args.dropout, num_heads=args.num_heads, kernel=args.kernel,
-                       use_bn=args.use_bn, use_residual=args.use_residual, use_graph=args.use_graph, use_weight=args.use_weight).to(device)
+                       use_bn=args.use_bn, use_residual=args.use_residual, use_graph=args.use_graph, use_weight=args.use_weight,
+                       num_gumbels=args.num_gumbels, tau=args.tau).to(device)
         suffix = 'hidden' + str(args.hidden_channels) + 'layers' + str(args.num_layers) + '100alpha' + str(int(100*args.alpha)) + 'kernel' + args.kernel
         suffix += 'heads' + str(args.num_heads) + 'bn' + str(args.use_bn) + 'residual' + str(args.use_residual) + 'graph' + str(args.use_graph) + 'weight' + str(args.use_weight)
 
@@ -99,7 +100,7 @@ def parser_add_main_args(parser):
     # utilities
     parser.add_argument('--input', type=int, default=128, help='input channel')
     parser.add_argument('--output', type=int, default=3, help='output channel')
-    parser.add_argument('--knn_num', type=int, default=2, help='number of k for KNN graph')
+    parser.add_argument('--knn_num', type=int, default=8, help='number of k for KNN graph')
     parser.add_argument('--save_model', action='store_true', help='whether to save model')
     parser.add_argument('--model_dir', type=str, default='/root/autodl-tmp/tyk/pgformer/model/')
     parser.add_argument('--directed', action='store_true',
@@ -113,16 +114,23 @@ def parser_add_main_args(parser):
     # pgformer model
     parser.add_argument('--method', type=str, default='pgformer')
     parser.add_argument('--hidden_channels', type=int, default=128)
-    parser.add_argument('--num_layers', type=int, default=1,
+    parser.add_argument('--num_layers', type=int, default=2,
                         help='number of layers for deep methods')
-    parser.add_argument('--num_heads', type=int, default=2,
+    parser.add_argument('--num_heads', type=int, default=1,
                         help='number of heads for attention')
     parser.add_argument('--use_bn', action='store_true', help='use layernorm')
     parser.add_argument('--alpha', type=float, default=0.5, help='weight for residual link')
     parser.add_argument('--use_residual', action='store_true', help='use residual link for each GNN layer')
-    parser.add_argument('--use_graph', action='store_true', help='use pos emb')
+    parser.add_argument('--use_graph', action='store_true', default=True,
+                        help='use the local EGNN branch (enabled by default)')
+    parser.add_argument('--no_use_graph', action='store_false', dest='use_graph',
+                        help='disable the local EGNN branch')
     parser.add_argument('--use_weight', action='store_true', help='use weight for GNN convolution')
     parser.add_argument('--kernel', type=str, default='simple', choices=['simple', 'sigmoid'])
+    parser.add_argument('--num_gumbels', type=int, default=4,
+                        help='number of Gumbel samples T in the global branch (Algorithm 2)')
+    parser.add_argument('--tau', type=float, default=1.0,
+                        help='Gumbel-Softmax temperature for the global branch')
 
     # baseline model
     parser.add_argument('--egnn_coord_channels', type=int, default=3,

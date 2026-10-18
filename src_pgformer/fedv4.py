@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import pandas as pd
 import faiss
 from itertools import combinations
+from math import comb
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
@@ -168,43 +169,153 @@ def split_dataset(df, num_clients):
         # 默认使用v3版本：每个数据集实例一个客户端
         return split_dataset_v3(df)
 
-def compute_shapley_values(client_gradients, global_test_data, global_model, args, device, pca):
+def _leverage_score_sampling(num_clients, budget):
+    """按杠杆分数 tau_S = 1 / C(K, |S|) 做互补配对采样（算法 3 第 4-10 行）。
+
+    每个采到的联盟 S 与其补集 S̄ 成对出现（|S|=s，|S̄|=K-s），不放回采样；
+    返回 (coalitions, realized)，其中 coalitions 为 ``(subset_tuple, size)`` 列表，
+    realized[s] 记录实际采到的大小为 s 的联盟数量（用于逆概率加权）。
+    """
+    interior_budget = max(1, budget - 2)  # 预留空集与全集两个联盟
+
+    def total_entries(c):
+        return sum(min(comb(num_clients, s), 2.0 * c) for s in range(1, num_clients))
+
+    # 二分求规模参数 c，使得 interior_budget = sum_s min(C(K, s), 2c)。
+    lo, hi = 0.0, 1.0
+    while total_entries(hi) < interior_budget:
+        hi *= 2.0
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        if total_entries(mid) < interior_budget:
+            lo = mid
+        else:
+            hi = mid
+    c = hi
+
+    coalitions = []
+    realized = [0] * (num_clients + 1)
+    # 只枚举 s <= K/2：规模 s 与 K-s 通过补集同时覆盖，避免重复采样。
+    for s in range(1, num_clients // 2 + 1):
+        full = comb(num_clients, s)
+        s_comp = num_clients - s
+        if full <= 2.0 * c + 1e-9:
+            subsets = list(combinations(range(num_clients), s))
+        else:
+            k_s = max(1, min(int(round(2.0 * c)), full))
+            subsets = _sample_subsets(num_clients, s, k_s)
+        for sub in subsets:
+            coalitions.append((sub, s))
+            realized[s] += 1
+            if s_comp != s:  # 自补集规模（K 为偶数且 s=K/2）不再重复添加补集
+                comp = tuple(i for i in range(num_clients) if i not in sub)
+                coalitions.append((comp, s_comp))
+                realized[s_comp] += 1
+    return coalitions, realized
+
+
+def _sample_subsets(num_clients, s, k):
+    """不放回地采样 k 个互不相同的大小为 s 的子集。"""
+    total = comb(num_clients, s)
+    if k >= total:
+        return list(combinations(range(num_clients), s))
+    seen = set()
+    out = []
+    while len(out) < k:
+        sub = tuple(sorted(random.sample(range(num_clients), s)))
+        if sub not in seen:
+            seen.add(sub)
+            out.append(sub)
+    return out
+
+
+def _solve_shapley_wls(coalitions, values, realized, num_clients, v_empty, v_grand):
+    """从采样联盟的效用中，通过带效率投影的加权最小二乘恢复 Shapley 向量（算法 3 第 18-23 行）。"""
+    delta = (v_grand - v_empty) / num_clients
+
+    rows = []
+    for (sub, s), val in zip(coalitions, values):
+        if s <= 0 or s >= num_clients:
+            continue
+        weight = 1.0 / (s * (num_clients - s) * max(realized[s], 1))
+        rows.append((sub, s, val, weight))
+
+    if not rows:
+        return [delta] * num_clients
+
+    m = len(rows)
+    A = np.zeros((m, num_clients))
+    b = np.zeros(m)
+    W = np.zeros(m)
+    for r, (sub, s, val, weight) in enumerate(rows):
+        for i in range(num_clients):
+            A[r, i] = (1.0 if i in sub else 0.0) - s / num_clients
+        b[r] = (val - v_empty) - delta * s
+        W[r] = weight
+
+    Aw = A.T * W                                   # A^T W  [K, m]
+    gram = Aw @ A + 1e-6 * np.eye(num_clients)     # A^T W A + 岭正则
+    rhs = Aw @ b
+    phi_perp = np.linalg.solve(gram, rhs)
+    phi = phi_perp + delta
+    return phi.tolist()
+
+
+def compute_shapley_values(client_gradients, client_sizes, global_test_data, global_model, args, device, pca, budget=None):
+    """基于杠杆分数采样的 Shapley 值估计（FedCWA 算法 3）。
+
+    用 Musco & Witter (2024) 的杠杆分数估计器替换精确的 2^K 联盟枚举：
+    以正比于 tau_S = 1 / C(K, |S|) 的概率采样 O(K log K) 个联盟，用尺寸加权的
+    客户端更新（式 10）构建虚拟模型并在评估集上计算效用，最后通过带效率投影的
+    加权最小二乘恢复 Shapley 向量。
+    """
     num_clients = len(client_gradients)
     if num_clients == 0:
         return []
-    shapley_values = [0.0 for _ in range(num_clients)]
+    if num_clients == 1:
+        return [1.0]
+
+    total_size = sum(client_sizes)
+    if total_size <= 0:
+        total_size = 1.0
+
+    # 尺寸加权的客户端更新：(|D_j| / sum |D|) * Delta_j（算法 3 第 12、15 行）。
+    # 维度适配器 kept local、不参与联邦，其梯度不进入效用/Shapley 估计。
+    weighted_grads = []
+    for j in range(num_clients):
+        factor = client_sizes[j] / total_size
+        weighted_grads.append({
+            k: g * factor for k, g in client_gradients[j].items()
+            if not (k.startswith('dim_adapter') or k.startswith('adapter_norm'))
+        })
+
     base_state = deepcopy(global_model.state_dict())
-    indices = list(range(num_clients))
-    for r in range(0, num_clients):
-        for subset in combinations(indices, r):
-            model_M = deepcopy(global_model).to(device)
-            state_M = model_M.state_dict()
-            for key in state_M.keys():
-                state = base_state[key].clone()
-                for j in subset:
-                    state = state + client_gradients[j][key]
-                state_M[key] = state
-            model_M.load_state_dict(state_M)
-            losses_M = evaluate(model_M, global_test_data, args, device)
-            score_M = (3 * losses_M[0] + 3 * losses_M[1] + 8 * losses_M[2]) / 14
-            score_M_val = score_M.item() if hasattr(score_M, "item") else float(score_M)
-            for i in indices:
-                if i in subset:
-                    continue
-                superset = subset + (i,)
-                model_Mp = deepcopy(global_model).to(device)
-                state_Mp = model_Mp.state_dict()
-                for key in state_Mp.keys():
-                    state = base_state[key].clone()
-                    for j in superset:
-                        state = state + client_gradients[j][key]
-                    state_Mp[key] = state
-                model_Mp.load_state_dict(state_Mp)
-                losses_Mp = evaluate(model_Mp, global_test_data, args, device)
-                score_Mp = (3 * losses_Mp[0] + 3 * losses_Mp[1] + 8 * losses_Mp[2]) / 14
-                score_Mp_val = score_Mp.item() if hasattr(score_Mp, "item") else float(score_Mp)
-                shapley_values[i] += score_M_val - score_Mp_val
-    print("Shapley values:")
+    eval_model = deepcopy(global_model).to(device)
+    eval_model.eval()
+
+    def utility(coalition):
+        state = {k: base_state[k].clone() for k in base_state}
+        for j in coalition:
+            for k in weighted_grads[j]:
+                state[k] = state[k] + weighted_grads[j][k]
+        eval_model.load_state_dict(state)
+        losses = evaluate(eval_model, global_test_data, args, device)
+        score = (3.0 * losses[0] + 3.0 * losses[1] + 8.0 * losses[2]) / 14.0
+        return -1.0 * (score.item() if hasattr(score, "item") else float(score))
+
+    # 采样预算 O(K log K)，上限为精确枚举的 2^K。
+    if budget is None:
+        budget = min(2 ** num_clients, num_clients * num_clients.bit_length() + 2)
+
+    coalitions, realized = _leverage_score_sampling(num_clients, budget)
+
+    v_empty = utility(())                       # v(∅)
+    v_grand = utility(tuple(range(num_clients)))  # v([K])
+    values = [utility(sub) for sub, _ in coalitions]
+
+    shapley_values = _solve_shapley_wls(coalitions, values, realized, num_clients, v_empty, v_grand)
+
+    print("Shapley values (Leverage-Score estimation):")
     for idx, sv in enumerate(shapley_values):
         print(f"  Client {idx}: Shapley={sv:.6f}")
     return shapley_values
@@ -237,27 +348,13 @@ def compute_aggregation_weights(client_models, client_sizes, client_ids, aggrega
             num_clients = len(client_models)
             weights = [1.0 / num_clients] * num_clients
         else:
-            print("正在计算基于性能的聚合权重（使用梯度与全局测试集）...")
-            shapley_values = compute_shapley_values(client_gradients, global_test_data, global_model, args, device, pca)
-            size_factors = client_sizes
-            total_size = sum(size_factors)
-            if total_size <= 0:
-                size_norm = [1.0 / len(size_factors)] * len(size_factors)
-            else:
-                size_norm = [s / total_size for s in size_factors]
-            quality_raw = [max(q, 0.0) for q in shapley_values]
-            total_quality = sum(quality_raw)
-            if total_quality > 0:
-                quality_norm = [q / total_quality for q in quality_raw]
-            else:
-                quality_norm = [0.0] * len(size_factors)
-            combined = [sn + qn for sn, qn in zip(size_norm, quality_norm)]
-            total_combined = sum(combined)
-            if total_combined <= 0:
-                num_clients = len(client_models)
-                weights = [1.0 / num_clients] * num_clients
-            else:
-                weights = [c / total_combined for c in combined]
+            print("正在计算基于性能的聚合权重（Leverage-Score Shapley 估计）...")
+            shapley_values = compute_shapley_values(client_gradients, client_sizes, global_test_data, global_model, args, device, pca)
+            # 对 Shapley 值做 softmax 归一化得到聚合权重（算法 3 第 24-26 行）。
+            phi = np.asarray(shapley_values, dtype=float)
+            phi = phi - phi.max()  # 数值稳定，不改变 softmax 结果
+            exp_phi = np.exp(phi)
+            weights = (exp_phi / exp_phi.sum()).tolist()
             print("Aggregation weights (performance_based):")
             for cid, sv, w in zip(client_ids, shapley_values, weights):
                 print(f"  Client {cid}: Shapley={sv:.6f}, Weight={w:.6f}")
@@ -288,8 +385,11 @@ def aggregate_models_v4(global_model, client_models, client_sizes, client_ids, a
     weights = compute_aggregation_weights(client_models, client_sizes, client_ids, aggregation_strategy, val_data, args, device, pca, global_test_data, client_gradients, global_model)
 
     # 执行模型聚合
+    # 维度适配器 kept local、不参与联邦（论文 3.2），聚合时跳过相关参数。
     global_state = global_model.state_dict()
     for key in global_state.keys():
+        if key.startswith('dim_adapter') or key.startswith('adapter_norm'):
+            continue
         global_state[key] = torch.zeros_like(global_state[key])
         for i, client_model in enumerate(client_models):
             global_state[key] += client_model.state_dict()[key] * weights[i]
